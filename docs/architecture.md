@@ -1,6 +1,6 @@
 # Architecture
 
-Owner: Member C. Last updated: _date_.
+Owner: Member C. Last updated: wednesday.
 
 This document describes how the Online Examination Network is put together: its components, how they communicate, and the formats the team agreed on. Details owned by other members are in `docs/protocol.md` (Member A) and `docs/sdn_design.md` (Member B).
 
