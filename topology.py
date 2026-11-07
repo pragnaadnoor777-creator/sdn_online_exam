@@ -60,8 +60,8 @@ def star_topo():
     # -----------------------------------------------------------------
     info("*** Starting HTTP server on srv (port 8080) ***\n")
 
-    srv.cmd('python3 %s/server.py > /tmp/srv.log 2>&1' % base)
-
+    srv.cmd('python3 %s/server.py > /tmp/srv.log 2>&1 &' % base)
+    time.sleep(1) 
     # -----------------------------------------------------------------
     # Generate background traffic from every exam host.
     # -----------------------------------------------------------------
