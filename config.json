@@ -1,6 +1,10 @@
 {
-  "server_ip": "10.0.0.1",
+  "server_ip": "10.0.0.100",
   "server_port": 5000,
-  "controller_ip": "127.0.0.1",
-  "controller_rest_port": 8080
+  "bg_host_ip": "10.0.0.200",
+  "iperf_port": 5001,
+  "controller_ip": "10.0.0.254",
+  "controller_rest_port": 8080,
+  "bottleneck_mbps": 10,
+  "_notes": "server_ip and bottleneck_mbps match Member B's topology (srv=10.0.0.100, 10 Mbps links). bg_host_ip and controller_ip are PLACEHOLDERS until Member B confirms the background host and how hosts reach the controller (e.g. NAT). Keys starting with _ are ignored by the code."
 }
