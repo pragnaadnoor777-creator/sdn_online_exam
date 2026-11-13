@@ -1,4 +1,7 @@
 import time
+import csv
+import json
+import os
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -8,10 +11,17 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types
 from ryu.lib import hub
 
-# ---------------- settings ----------------
-LINK_MBPS        = 10            # matches bw=10 in topology.py
-SERVER_PORT      = 6             # srv is the 6th link added -> port 6 on s1
-SERVER_IP        = '10.0.0.100'
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+with open(os.path.join(ROOT, 'config.json')) as f:
+    CFG = json.load(f)
+
+LINK_MBPS        = CFG['bottleneck_mbps']   # speed of the srv link
+SERVER_PORT      = 1                        # srv is the first link added -> port 1 on s1
+SERVER_IP        = CFG['server_ip']
+EXAM_PORT        = CFG['server_port']       # TCP port of the exam server
+EXAM_PRIORITY    = 20                       # above the limit rule (10)
+SDN_MODE         = os.environ.get('EXAM_MODE', 'sdn').lower() == 'sdn'
+STATS_CSV        = os.environ.get('STATS_CSV', 'controller_stats.csv')
 POLL_INTERVAL    = 2             # seconds between stats requests
 THRESHOLD_PCT    = 80            # congestion above 80% of the srv link
 
@@ -34,6 +44,10 @@ class ExamCongestionApp(app_manager.RyuApp):
         self.prev_time = {}       # {dpid: time of last stats reply}
         self.limited = {}         # {port: time when its limit expires}
         self.congested = False
+        if not os.path.exists(STATS_CSV):
+            with open(STATS_CSV, 'w') as f:
+                f.write('timestamp,srv_link_mbps,utilization_pct,congested,limited_ports\n')
+        self.logger.info("Mode: %s", "SDN" if SDN_MODE else "BASELINE")
         self.monitor_thread = hub.spawn(self._monitor)
 
     # ---------- switch connects ----------
@@ -47,7 +61,11 @@ class ExamCongestionApp(app_manager.RyuApp):
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER,
                                           ofp.OFPCML_NO_BUFFER)]
         self._add_flow(dp, 0, match, actions)
-
+        # exam traffic gets a higher-priority flow than the rate limit (SDN mode only)
+        if SDN_MODE:
+            m = parser.OFPMatch(eth_type=0x0800, ip_proto=6,
+                                ipv4_dst=SERVER_IP, tcp_dst=EXAM_PORT)
+            self._add_flow(dp, EXAM_PRIORITY, m, [parser.OFPActionOutput(SERVER_PORT)])
         # meter used by the rate limit (delete first in case it exists)
         dp.send_msg(parser.OFPMeterMod(
             datapath=dp, command=ofp.OFPMC_DELETE,
@@ -151,13 +169,18 @@ class ExamCongestionApp(app_manager.RyuApp):
         pct = srv_mbps / LINK_MBPS * 100
         self.logger.info("srv link: %.2f Mbps (%.0f%%)  limited ports: %s",
                          srv_mbps, pct, sorted(self.limited) or "none")
-
+        with open(STATS_CSV, 'a') as f:
+            csv.writer(f).writerow([
+                time.strftime('%Y-%m-%dT%H:%M:%S'), round(srv_mbps, 2),
+                round(pct, 1), int(pct >= THRESHOLD_PCT),
+                ';'.join(map(str, sorted(self.limited)))])
         if pct >= THRESHOLD_PCT:
             if not self.congested:
                 self.congested = True
                 self.logger.warning("CONGESTION on srv link: %.2f Mbps",
                                     srv_mbps)
-            self._limit_heaviest(dp, rates, now)
+            if SDN_MODE:    
+                self._limit_heaviest(dp, rates, now)
         elif self.congested:
             self.congested = False
             self.logger.info("srv link recovered")
