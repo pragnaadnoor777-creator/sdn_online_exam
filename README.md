@@ -2,294 +2,305 @@
 
 SDN-Socket Programming Jackfruit Mini Project, Topic #18.
 
-A multi-user online examination system built on TCP sockets and deployed in a Mininet network managed by an SDN controller. The controller monitors and manages exam traffic, and the project compares its behavior against a plain learning-switch baseline under congestion.
+A multi-user online examination application built with TCP sockets and deployed in a Mininet network managed by an SDN controller. The controller monitors the server-facing link and, in SDN mode, applies a meter-based rate limit when the link becomes congested. Experiments compare the same topology in baseline and SDN modes.
 
 ## Team
 
-| Name | SRN | Role |
-|---|---|---|
-| Poornaprajna | PES2UG25CS372 |  Application (server, client, protocol) |
-| Rampranav | PES2UG25CS359 | SDN and network (topology, controller) |
-| Pragna Adnoor | PES2UG25CS377 | Integration, experiments, documentation |
-
-## Table of contents
-
-1. [Overview](#1-overview)
-2. [Architecture](#2-architecture)
-3. [Repository structure and ownership](#3-repository-structure-and-ownership)
-4. [Requirements and installation](#4-requirements-and-installation)
-5. [Configuration](#5-configuration)
-6. [How to run](#6-how-to-run)
-7. [Application protocol](#7-application-protocol)
-8. [SDN design](#8-sdn-design)
-9. [Test cases](#9-test-cases)
-10. [Experiments and results](#10-experiments-and-results)
-11. [Limitations and future work](#11-limitations-and-future-work)
-12. [Contributing rules](#12-contributing-rules)
-13. [Documentation index](#13-documentation-index)
-
-## 1. Overview
-
-**Problem.** Develop a multi-user online examination application where students connect through TCP sockets. The SDN network monitors and manages the examination traffic.
-
-**What the system does**
-
-- Concurrent TCP exam server that handles many students at once
-- Question delivery, answer submission, server-side exam timer, and result calculation
-- Mininet topology with a bottleneck link (and an alternate path) to create realistic congestion
-- SDN controller that classifies exam traffic, monitors flow and port statistics, and reacts dynamically (prioritization, rate limiting, rerouting)
-- Experiments comparing the SDN-managed network against a static baseline
-
-## 2. Architecture
-
-_Insert the architecture diagram here (`docs/architecture.png`)._
-
-```
- Student clients (h2..hN)  --TCP-->  Switches (OpenFlow)  -->  Exam server (h1)
-                                          |   ^
-                                    flow rules / stats
-                                          v   |
-                                    SDN controller  <--exam events--  Exam server
-```
-
-**Components**
-
-| Component | Description |
+| Member | Responsibility |
 |---|---|
-| Exam server | Concurrent TCP server: login, questions, answers, timer, scoring |
-| Student clients | Interactive client and an automated client that simulates N students |
-| Mininet topology | Hosts, OpenFlow switches, bottleneck link, alternate path |
-| SDN controller | Classification, stats polling, dynamic policies, receives exam events |
-| Integration module | Lets the server notify the controller of exam events |
-| Experiment scripts | Generate load, run baseline and SDN modes, analyze results |
+| Member A — Poornaprajna | Application: server, client, examination protocol |
+| Member B — Rampranav | SDN and network: Mininet topology, OpenFlow controller |
+| Member C — Pragna Adnoor | Integration, experiments, configuration and documentation |
 
-**Socket-SDN integration.** The server notifies the controller of exam events (exam start, exam end, student count changes). The controller responds by installing, adjusting or removing flow rules.
+## 1. Project objective
+
+The project demonstrates an online examination system while background traffic competes for network capacity. Students connect to an examination server using TCP. A separate background host sends controlled UDP traffic to the server. The SDN controller monitors the switch's server-facing port and, in SDN mode, rate-limits the heaviest sender when the configured utilization threshold is reached.
+
+The project compares:
+
+- **Baseline mode:** The same controller operates as a learning switch and records port statistics, but does not install the SDN exam-priority rule or trigger the rate-limit flow.
+- **SDN mode:** The controller installs a higher-priority flow for TCP examination traffic and can apply a meter-based rate limit to a heavy sender.
+
+This repository's current topology has one switch and one server-facing bottleneck. It has no alternate path, so link-failure rerouting is not implemented.
+
+## 2. Actual architecture and host mapping
+
+The source of truth for the topology is `topology/topology.py`.
+
+| Mininet node | IP address | Switch port | Purpose | Link settings |
+|---|---|---:|---|---|
+| `srv` | `10.0.0.100/24` | 1 | TCP exam server and UDP iperf receiver | 10 Mbps, 30 ms |
+| `bg` | `10.0.0.200/24` | 2 | Background UDP traffic source | 100 Mbps; no delay specified |
+| `h1` | `10.0.0.1/24` | 3 | Student host | 100 Mbps, 30 ms |
+| `h2` | `10.0.0.2/24` | 4 | Student host | 100 Mbps, 30 ms |
+| `h3` onward | `10.0.0.3/24` onward | 5 onward | Student hosts | 100 Mbps, 30 ms |
+
+The number of student hosts is controlled by `--students` (default 10, maximum 99). `srv` and `bg` are added before the student hosts. Switch port numbering follows the `addLink` order, so the controller expects the server to remain on port 1 and the background host on port 2.
+
+The server-facing link is the 10 Mbps bottleneck. Student and background links have higher configured bandwidth, so traffic destined for `srv` ultimately competes for the 10 Mbps server link.
+
+```text
+                        Ryu controller
+                     127.0.0.1:6653
+                           |
+                   OpenFlow 1.3 control
+                           |
+                    Open vSwitch s1
+                 /        |        \\
+          port 1 /   port 2|         \\ port 3 onward
+               /          |          \\
+      srv 10.0.0.100   bg 10.0.0.200   h1 ... hN
+      10 Mbps/30 ms    100 Mbps       student hosts
+      TCP 5000
+      UDP 5001
+```
 
 ## 3. Repository structure and ownership
 
-Every file has exactly one owner. Only the owner edits it.
+Only edit files assigned to your team role. Ask the relevant owner before changing another member's implementation.
 
-```
+```text
 .
-├── README.md                  # C
-├── config.json                # C (A and B read only)
-├── requirements.txt           # C
-├── .gitignore                 # C
-├── .github/CODEOWNERS         # C
-├── server/                    # A: server.py, exam_logic.py, questions.json
-├── client/                    # A: client.py, auto_client.py
-├── tests/functional/          # A
-├── controller/                # B: baseline_controller.py, exam_controller.py,
-│                              #    stats_monitor.py, rest_api.py
-├── topology/                  # B: topo.py
-├── integration/               # C: notifier.py
-├── experiments/               # C: run_experiment.sh, traffic_gen.sh, analyze.py
-├── results/                   # C: raw/ and graphs/
-├── logs/                      # runtime output (git-ignored)
+├── README.md                         # C
+├── config.json                       # C; A and B read it
+├── requirements.txt                  # C
+├── .gitignore                        # C
+├── server/                           # A: server.py, exam_logic.py, questions.json
+├── client/                           # A: client.py, auto_client.py
+├── tests/functional/                 # A
+├── controller/trustme.py             # B
+├── topology/topology.py               # B
+├── integration/                      # C: notifier.py, test_listener.py
+├── experiments/                      # C: run_experiment.sh, traffic_gen.sh, analyze.py
+├── results/raw/                       # C: experiment outputs
+├── results/graphs/                    # C: summaries and plots
 └── docs/
-    ├── protocol.md            # A
-    ├── sdn_design.md          # B
-    ├── architecture.md        # C
-    └── test_cases.md          # C
+    ├── protocol.md                    # A
+    ├── sdn_design.md                  # B
+    ├── architecture.md                # C
+    └── test_cases.md                  # C
 ```
 
-## 4. Requirements and installation
+## 4. Ports and configuration
 
-**Environment:** Ubuntu 20.04 / 22.04 VM (VirtualBox or VMware) with sudo access. Mininet runs only on Linux. The application code (server and client) can also be tested on any OS using localhost.
+The current topology and source use these service ports:
+
+| Port | Protocol | Purpose |
+|---:|---|---|
+| 6653 | TCP | OpenFlow connection from switch to Ryu |
+| 5000 | TCP | Examination server |
+| 5001 | UDP | iperf background-traffic receiver |
+| 8080 | TCP/HTTP | Configured notifier target port; the controller endpoint is not implemented in `trustme.py` |
+| 8081 | TCP/HTTP | Default port of the local dummy notifier listener after the C-owned port change |
+
+`config.json` currently defines `server_ip=10.0.0.100`, `server_port=5000`, `bg_host_ip=10.0.0.200`, `iperf_port=5001`, and `bottleneck_mbps=10`. Its `controller_ip=10.0.0.254` is a placeholder until the team supplies a reachable controller address for processes inside the Mininet host namespace. `controller_rest_port=8080` is the notifier target setting.
+
+Do not set `controller_ip` to `127.0.0.1` for the exam server inside Mininet: loopback inside `srv` refers to `srv` itself, not the Linux host running Ryu. The current controller source does not implement the `/exam/event` HTTP endpoint, so the real notifier-to-controller REST integration remains incomplete. The notifier is designed to fail safely and not crash the exam server if the endpoint is unreachable.
+
+## 5. Software requirements
+
+Use one Linux environment for Ryu and Mininet. The switch connects to `127.0.0.1:6653`, so running Ryu in VirtualBox and Mininet in WSL (or vice versa) will not make that loopback address connect.
+
+System packages on Ubuntu:
 
 ```bash
-# System packages
-sudo apt update && sudo apt upgrade -y
-sudo apt install mininet openvswitch-switch iperf python3-pip git -y
-
-# Clone the repository
-git clone <repo-url>
-cd <repo-name>
-
-# Python dependencies (controller, plotting, etc.)
-pip3 install -r requirements.txt
+sudo apt update
+sudo apt install mininet openvswitch-switch iperf iproute2 python3-pip python3-venv git -y
 ```
 
-**Verify Mininet**
+The controller source imports `ryu.*`, so this revision expects `ryu-manager` from a working Ryu Python environment. Mininet is commonly installed for the system Python; use `/usr/bin/python3` for the topology when needed. Install the analysis dependencies in the Python environment used for `analyze.py`:
 
 ```bash
-sudo mn --topo single,3
-mininet> pingall      # expect 0% packet loss
-mininet> exit
-sudo mn -c            # clean up
+python3 -m pip install pandas matplotlib
 ```
 
-**Verify the controller**
+Check prerequisites:
 
 ```bash
+which ryu-manager
 ryu-manager --version
+which mn
+mn --version
+iperf --version
+/usr/bin/python3 -c "import mininet; print('Mininet import OK')"
 ```
 
-> The controller is assumed to be Ryu (OpenFlow 1.3). Update this section if the team uses a different controller.
+The traffic generator uses classic iperf 2 command-line syntax (`iperf -s -u` and `iperf -c ... -u`).
 
-## 5. Configuration
+## 6. Configuration and controller modes
 
-Shared settings live in `config.json`. Do not hardcode IPs or ports in code.
+The topology reads `config.json`. The controller also reads `server_ip`, `server_port`, and `bottleneck_mbps` from that file.
 
-| Key | Meaning | Draft value |
-|---|---|---|
-| `server_ip` | Exam server address inside Mininet | `10.0.0.1` |
-| `server_port` | Exam server TCP port | `5000` |
-| `controller_ip` | Address the exam server uses to reach the controller's event endpoint | _set after topology is final_ |
-| `controller_rest_port` | Port of the controller's event endpoint | `8080` |
-
-**Notes on these values**
-
-- `server_ip` assumes the server runs on `h1` with Mininet's default addressing. The real mapping is in `docs/sdn_design.md`.
-- Each Mininet host has its own network namespace, so `127.0.0.1` inside `h1` is **not** the controller. `controller_ip` must be an address the hosts can reach (for example a NAT or root-namespace interface added in `topology/topo.py`). It is finalized once the topology is final.
-- On macOS, port 5000 is often used by AirPlay Receiver. If local testing fails, use another port (for example 5050) and keep `config.json` consistent.
-- Port 8080 is the default of Ryu's built-in web server. Change it if another tool uses it.
-
-## 6. How to run
-
-Run all commands from the repository root. Open one terminal per step, in this order.
-
-**Step 1: clean old Mininet state**
+Both modes use `controller/trustme.py`. The environment variable `EXAM_MODE` selects the controller behavior:
 
 ```bash
+EXAM_MODE=sdn ryu-manager --ofp-tcp-listen-port 6653 controller/trustme.py
+```
+
+or:
+
+```bash
+EXAM_MODE=baseline ryu-manager --ofp-tcp-listen-port 6653 controller/trustme.py
+```
+
+The default is `sdn` when `EXAM_MODE` is not set. The topology's `--mode` argument is accepted for compatibility but is ignored by the current topology source. **Do not use `--mode` on the topology to select baseline or SDN. Set `EXAM_MODE` before starting Ryu.**
+
+Controller parameters in `controller/trustme.py`:
+
+| Parameter | Current value | Meaning |
+|---|---:|---|
+| `POLL_INTERVAL` | 2 s | Port-statistics polling interval |
+| `THRESHOLD_PCT` | 80% | Congestion trigger |
+| `LIMIT_KBPS` | 2000 | Meter rate (2 Mbps) |
+| `LIMIT_SECONDS` | 30 s | Hard timeout on the limit flow |
+| `MIN_SENDER_MBPS` | 1.0 | Ignore senders below this input rate |
+| `SERVER_PORT` | 1 | Switch port connected to `srv` |
+| `EXAM_PORT` | 5000 | TCP exam destination port |
+
+In SDN mode the controller installs an exam TCP flow at priority 20. Its rate-limit flow has priority 10 and matches IPv4 traffic from a selected input port to the server. The table-miss rule has priority 0 and learned flows have priority 1. The higher-priority exam flow is intended to keep matching TCP exam traffic out of the lower-priority rate-limit rule.
+
+## 7. Manual run procedure
+
+Run all commands from the repository root. Keep Ryu and Mininet in the same Linux environment.
+
+**Terminal 1 — start Ryu:**
+
+```bash
+cd ~/sdn_online_exam
+source ~/ryu-env/bin/activate
+mkdir -p logs
+EXAM_MODE=sdn STATS_CSV="$PWD/logs/controller_stats.csv" \
+  ryu-manager --ofp-tcp-listen-port 6653 controller/trustme.py
+```
+
+For baseline, stop Ryu and restart it with `EXAM_MODE=baseline`.
+
+**Terminal 2 — start Mininet:**
+
+```bash
+cd ~/sdn_online_exam
 sudo mn -c
+sudo /usr/bin/python3 topology/topology.py --students 5
 ```
 
-**Step 2: start the controller** (Terminal 1)
+The topology itself starts the TCP exam server and UDP iperf receiver on `srv`. Do not start duplicate server or iperf receiver processes manually.
+
+At the `mininet>` prompt:
+
+```text
+nodes
+net
+pingall
+```
+
+Check that all nodes appear and that `pingall` has 0% packet loss. The controller terminal should report that switch `s1` connected.
+
+Run automated students from a student host:
+
+```text
+h1 python3 client/auto_client.py --host 10.0.0.100 --port 5000 --students 5 --results-dir /absolute/path/to/sdn_online_exam/results/raw/manual
+```
+
+Generate background traffic from the dedicated `bg` host:
+
+```text
+bg bash experiments/traffic_gen.sh --level medium --target 10.0.0.100 --duration 20
+bg bash experiments/traffic_gen.sh --level heavy --target 10.0.0.100 --duration 30
+```
+
+The topology automatically starts the UDP receiver on `srv:5001`. The traffic generator defaults to the IP, port and bottleneck rate in `config.json` if `--target` and `--port` are omitted.
+
+Exit Mininet with `exit`. Stop Ryu with Ctrl+C.
+
+## 8. Automated experiment runner
+
+The C-owned runner automates one run, creates a unique folder under `results/raw/`, starts Ryu, starts the topology, runs `auto_client.py`, generates background traffic, and collects logs. It uses the same `controller/trustme.py` for both modes and sets `EXAM_MODE` for the selected mode.
+
+Close any manually running Mininet topology and controller first. Activate the Ryu environment, then run from the repository root:
 
 ```bash
-# SDN mode
-ryu-manager controller/exam_controller.py
-
-# Baseline mode (plain learning switch)
-ryu-manager controller/baseline_controller.py
+source ~/ryu-env/bin/activate
+bash experiments/run_experiment.sh --mode sdn --students 5 --load medium --duration 20
+bash experiments/run_experiment.sh --mode baseline --students 5 --load medium --duration 20
 ```
 
-**Step 3: start the topology** (Terminal 2)
+Other valid loads are `none` and `heavy`; valid student counts are 1 through 99. The runner starts a new unique run directory such as:
+
+```text
+results/raw/sdn_5students_mediumload_1/
+```
+
+Typical output files include `client_events.csv`, `controller_stats.csv`, `controller.log`, `topology.log`, `auto_client.log`, `traffic_sender.log`, `iperf_receiver.log`, and `run_info.txt`. A `server.log` is collected when the topology process's working directory is inherited by the server process.
+
+The automated runner is a shell orchestrator around an interactive Mininet CLI. Its behavior must be verified in the team's actual Linux/Ryu/Mininet environment; syntax checks alone do not prove the whole experiment works.
+
+## 9. Analyze experiment results
+
+Install pandas and matplotlib, then run:
 
 ```bash
-sudo python3 topology/topo.py --mode sdn          # or --mode baseline
+python3 experiments/analyze.py results/raw
 ```
 
-This opens the Mininet CLI. The host mapping (`h1` = exam server, `h2` to `hN` = students, remaining hosts = background traffic) is documented in `docs/sdn_design.md`.
+The analyzer reads the current client CSV schema:
 
-**Step 4: start the exam server** (inside the Mininet CLI)
+```text
+ timestamp,student_id,event,question_id,details
+```
+
+It pairs `ANSWER_SENT` and `ACK_RECEIVED` by student and question ID, then calculates mean answer latency, 95th-percentile latency and Jain's fairness index using reciprocal per-student mean latency. It also reads the controller schema:
+
+```text
+ timestamp,srv_link_mbps,utilization_pct,congested,limited_ports
+```
+
+Outputs are written to `results/graphs/summary.csv` and `results/graphs/latency_<load>.png`.
+
+Do not report improvement until you have matching baseline and SDN runs with the same number of students, load and duration. Repeat each condition several times and compare the averages.
+
+## 10. Notifier test
+
+The notifier sends HTTP POST requests to the configured `controller_ip:controller_rest_port` and `/exam/event`. The current controller source does not include this endpoint, so test the notifier independently using the C-owned dummy listener.
+
+Terminal 1:
 
 ```bash
-mininet> h1 python3 server/server.py --port 5000 &
+python3 integration/test_listener.py
 ```
 
-**Step 5: start background traffic** (optional, to create congestion)
+It listens on `127.0.0.1:8081` by default. For the test only, temporarily set `controller_ip` to `127.0.0.1` and `controller_rest_port` to `8081` in `config.json`, run `notify_controller(...)`, and then restore the original configuration. Do not confuse this dummy listener with the real Ryu controller REST service.
 
-```bash
-mininet> h8 bash experiments/traffic_gen.sh --level heavy &
-```
+## 11. Test cases
 
-**Step 6: start student clients**
+See [`docs/test_cases.md`](docs/test_cases.md) for the scenarios, expected outcomes, current implementation status and commands. A source-code implementation status is not the same as a test that has actually been run and passed.
 
-```bash
-# Automated: simulate 5 students
-mininet> h2 python3 client/auto_client.py --host 10.0.0.1 --port 5000 --students 5 &
+## 12. Known limitations
 
-# Interactive: a single student
-mininet> h3 python3 client/client.py --host 10.0.0.1 --port 5000
-```
+- The network is emulated in Mininet rather than built from physical switches and hosts.
+- The topology has one switch and one server-facing bottleneck, with no alternate path or link-failure rerouting.
+- The controller's exam-event REST endpoint is not present in `controller/trustme.py`; the notifier can be tested with the dummy listener, but end-to-end HTTP event integration is not complete.
+- `config.json` has a placeholder `controller_ip` for the notifier. The controller address reachable from a Mininet host must be agreed and configured before real event delivery.
+- `server/questions.json` is empty in the supplied project snapshot. `ExamLogic` uses its built-in questions only when the relative `questions.json` path does not exist; an empty JSON file is not a valid question bank. Member A should provide a valid question bank or correct the loading behavior.
+- Ryu/Open vSwitch meter support must be verified on the actual machine; an OpenFlow error in the controller log means the corresponding meter operation may not have succeeded.
+- The current controller rate-limits the heaviest sender's IPv4 traffic to the server. It does not implement a general QoS scheduler or rerouting.
+- Traffic is not encrypted.
+- Experiment outputs depend on the runtime environment and must be collected before performance claims are made.
 
-**Run a full automated experiment (one command)**
+## 13. Contributing and Git workflow
 
-```bash
-bash experiments/run_experiment.sh --mode sdn --students 10 --load heavy
-bash experiments/run_experiment.sh --mode baseline --students 10 --load heavy
-python3 experiments/analyze.py results/raw/
-```
+1. Edit only files assigned to you. Ask the owner before changing another member's files.
+2. Do not commit directly to `main`; create a task branch such as `c/experiment-runner`.
+3. Run syntax and functional checks before committing.
+4. Stage only files you own; do not use `git add .` when other members' changes are present.
+5. Pull/rebase from `origin/main` only after coordinating any shared changes. Resolve conflicts without discarding other members' work.
+6. Push your branch and open a pull request for review.
+7. Never force-push to the shared branch.
 
-**Run the application locally (outside Mininet) for quick testing**
+## 14. Documentation index
 
-```bash
-python3 server/server.py --port 5000
-python3 client/client.py --host 127.0.0.1 --port 5000
-```
-
-## 7. Application protocol
-
-Full specification: [`docs/protocol.md`](docs/protocol.md).
-
-| Message | Direction | Purpose |
+| Document | Owner | Contents |
 |---|---|---|
-| `LOGIN` | client to server | Join the exam with a student ID |
-| `START` | server to client | Begin the exam (duration, number of questions) |
-| `QUESTION` | server to client | Deliver a question |
-| `ANSWER` | client to server | Submit an answer |
-| `ACK` | server to client | Confirm receipt |
-| `TIME_UP` | server to client | Exam timer expired |
-| `RESULT` | server to client | Final score |
-
-_Update this table so it matches `docs/protocol.md` exactly._
-
-## 8. SDN design
-
-Full details: [`docs/sdn_design.md`](docs/sdn_design.md).
-
-- **Classification:** TCP traffic to the exam server port is matched and given higher priority than background traffic.
-- **Monitoring:** flow and port statistics are polled periodically to compute link utilization and per-student throughput.
-- **Dynamic behavior:** _(fill in what you implemented)_ prioritization under congestion, limiting background flows, rerouting on link failure.
-- **Socket-SDN integration:** exam events from the server trigger controller actions.
-
-| Parameter | Value |
-|---|---|
-| Stats polling interval | _x_ seconds |
-| Congestion threshold | _x_% link utilization |
-| Priority of exam flows | _x_ |
-
-## 9. Test cases
-
-Full table: [`docs/test_cases.md`](docs/test_cases.md).
-
-| ID | Scenario | Expected result | Status |
-|---|---|---|---|
-| T1 | Normal exam with one student | Questions delivered, score correct | |
-| T2 | Multiple concurrent students | All complete, no mixed-up answers | |
-| T3 | Late submission after timer | Answer rejected | |
-| T4 | Client disconnects mid-exam | Server stays up, session handled | |
-| T5 | Duplicate login | Second login rejected | |
-| T6 | Exam under heavy congestion | Exam traffic prioritized (SDN mode) | |
-| T7 | Link failure | Traffic rerouted, exam continues | |
-
-## 10. Experiments and results
-
-**Metrics:** response time per question, answer-submission latency, throughput, packet loss, link utilization, fairness across students (Jain's index).
-
-**Conditions:** baseline vs SDN, with 3 / 6 / 10 students and no / medium / heavy congestion.
-
-_Insert graphs from `results/graphs/` here, for example:_
-
-```
-![Response time: baseline vs SDN](results/graphs/response_time.png)
-```
-
-_Add a short analysis: what improved, by how much, and why._
-
-## 11. Limitations and future work
-
-- _List known limitations, for example a simulated rather than real network, no encryption, a small question bank._
-- _List ideas for future work._
-
-## 12. Contributing rules
-
-1. Edit only the files you own (section 3). Need a change elsewhere? Open an Issue or message the owner.
-2. Never commit directly to `main`. Use one branch per task (`a/...`, `b/...`, `c/...`) and open a pull request.
-3. Every pull request is reviewed by another member (A's by B, B's by C, C's by A).
-4. Before pushing, run `git pull --rebase origin main`. Never force-push.
-5. Do not commit generated files (`__pycache__`, `logs/`, large pcaps, virtual environments).
-6. Read shared settings from `config.json`. Do not hardcode IPs or ports.
-7. Run Python from the repository root so cross-folder imports work.
-8. Merge small and often. Large late merges cause conflicts and demo failures.
-
-## 13. Documentation index
-
-| Document | Contents |
-|---|---|
-| [`docs/protocol.md`](docs/protocol.md) | Message formats and error codes |
-| [`docs/sdn_design.md`](docs/sdn_design.md) | Flow rules, policies, thresholds, host/IP mapping |
-| [`docs/architecture.md`](docs/architecture.md) | Architecture diagram and communication flow |
-| [`docs/test_cases.md`](docs/test_cases.md) | Test cases and results |
+| `docs/protocol.md` | A | Application messages and error codes |
+| `docs/sdn_design.md` | B | OpenFlow rules, policies and thresholds |
+| `docs/architecture.md` | C | Components, topology and communication flow |
+| `docs/test_cases.md` | C | Test scenarios and implementation/test status |

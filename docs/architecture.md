@@ -1,188 +1,209 @@
 # Architecture
 
-Owner: Member C. Last updated: wednesday.
+Owner: Member C. Updated: 2026-11-18.
 
-This document describes how the Online Examination Network is put together: its components, how they communicate, and the formats the team agreed on. Details owned by other members are in `docs/protocol.md` (Member A) and `docs/sdn_design.md` (Member B).
+This document records the architecture visible in the current source files. The application protocol is owned by Member A (`docs/protocol.md`); detailed OpenFlow/controller design is owned by Member B (`docs/sdn_design.md`). This document does not replace those specifications.
 
 ## 1. System overview
 
-The system is a multi-user online examination application running over an emulated Software-Defined Network.
+The project combines a multi-user TCP online examination application with an emulated Software-Defined Network.
 
-- Students connect to an **exam server** through **TCP sockets**, receive questions, submit answers, and receive a score at the end.
-- The network between students and the server is emulated in **Mininet** and is managed by an **SDN controller** using OpenFlow.
-- The controller **monitors** exam traffic and **reacts dynamically**, for example by prioritizing exam flows when the network is congested.
-- The project compares two network modes, a plain **baseline** and the **SDN-managed** mode, to measure what the SDN adds.
+- Student clients connect to the examination server using TCP.
+- The server authenticates student IDs, sends questions, receives answers, enforces an exam timer and returns results.
+- Mininet creates the virtual network. Open vSwitch `s1` forwards packets using OpenFlow 1.3 rules.
+- Ryu runs the controller application in `controller/trustme.py`.
+- In SDN mode, the controller monitors the server-facing link and can rate-limit the heaviest sender when utilization reaches the configured threshold.
+- The experiment scripts generate controlled background traffic and collect client/controller output so baseline and SDN runs can be compared.
 
-## 2. Components
+## 2. Components and ownership
 
-| # | Component | Description | Owner | Code location |
-|---|---|---|---|---|
-| 1 | Exam server | Concurrent TCP server: login, question delivery, answer collection, server-side timer, scoring | A | `server/` |
-| 2 | Student clients | Interactive client, and an automated client that simulates N students | A | `client/` |
-| 3 | Mininet topology | Hosts, OpenFlow switches, a bottleneck link, an alternate path, background-traffic hosts | B | `topology/` |
-| 4 | SDN controller | Baseline learning switch, and the exam-aware controller with traffic classification, statistics monitoring and dynamic policies | B | `controller/` |
-| 5 | Integration module | Lets the exam server notify the controller of exam events | C | `integration/` |
-| 6 | Experiment scripts | Generate background load, run baseline and SDN experiments, analyze logs, draw graphs | C | `experiments/` |
+| Component | Responsibility | Owner | Source location |
+|---|---|---|---|
+| Exam server | Concurrent TCP sessions, login, questions, answers, timer and score | A | `server/` |
+| Student clients | Interactive student and concurrent automated students | A | `client/` |
+| Mininet topology | Creates switch, server, background host, student hosts and links | B | `topology/topology.py` |
+| SDN controller | Learning switch, port-statistics polling, congestion detection and meter-based limiting | B | `controller/trustme.py` |
+| Notifier | Sends exam lifecycle/student events by HTTP POST | C | `integration/notifier.py` |
+| Dummy listener | Receives notifier POSTs for isolated testing | C | `integration/test_listener.py` |
+| Experiment scripts | Background load, automated run orchestration and result analysis | C | `experiments/` |
+| Configuration/results/docs | Shared settings, raw results, graphs and project documentation | C | `config.json`, `results/`, `docs/` |
 
-## 3. Architecture diagram
+## 3. Current topology
+
+The source of truth is `topology/topology.py`. It creates one switch named `s1`, a server host `srv`, a background host `bg`, and a configurable number of student hosts `h1` through `hN`.
+
+| Host | Purpose | IP | Switch port | Link bandwidth | Delay configured |
+|---|---|---|---:|---:|---|
+| `srv` | Exam server and iperf receiver | `10.0.0.100/24` | 1 | 10 Mbps | 30 ms |
+| `bg` | UDP background traffic source | `10.0.0.200/24` | 2 | 100 Mbps | Not specified |
+| `h1` | Student client host | `10.0.0.1/24` | 3 | 100 Mbps | 30 ms |
+| `h2` | Student client host | `10.0.0.2/24` | 4 | 100 Mbps | 30 ms |
+| `h3` to `hN` | Student client hosts | `10.0.0.3/24` onward | 5 onward | 100 Mbps | 30 ms |
+
+The topology accepts `--students` (default 10, maximum 99). The host-to-switch port numbering follows `addLink` order. `srv` must remain the first host link so that its switch port stays at 1, as assumed by the controller.
 
 ```mermaid
-flowchart LR
-    subgraph Students["Student hosts"]
-        S1[Student h2]
-        S2[Student h3]
-        S3[Student hN]
-    end
-
-    BG[Background traffic host]
-
-    SW1[OpenFlow switch s1]
-    SW2[OpenFlow switch s2]
-    SRV[Exam server h1<br/>TCP port 5000]
-    CTRL[SDN controller<br/>Ryu]
-
-    S1 --> SW1
-    S2 --> SW1
-    S3 --> SW1
-    BG --> SW1
-    SW1 -- "bottleneck link" --> SW2
-    SW2 --> SRV
-
-    CTRL -. "OpenFlow: flow rules, stats" .-> SW1
-    CTRL -. "OpenFlow: flow rules, stats" .-> SW2
-    SRV -. "exam events (notifier.py)" .-> CTRL
+flowchart TB
+    RYU[Ryu controller\n127.0.0.1:6653]
+    SW[Open vSwitch s1\nOpenFlow 1.3]
+    SRV[srv\n10.0.0.100\nTCP 5000 / UDP 5001]
+    BG[bg\n10.0.0.200\nbackground UDP source]
+    H[Student hosts\nh1...hN\n10.0.0.1...]
+    RYU -. OpenFlow rules and statistics .-> SW
+    SW ---|10 Mbps, 30 ms| SRV
+    SW ---|100 Mbps| BG
+    SW ---|100 Mbps, 30 ms each| H
 ```
 
-_The diagram above is a draft. Update it to match the final topology in `docs/sdn_design.md` (number of switches, alternate path, host names). If you prefer a drawn image, add it as `docs/architecture.png` and reference it here._
+All host traffic destined for `srv` crosses the 10 Mbps `s1`–`srv` link. This link is the project's bottleneck. There is one switch and no alternate path; rerouting after link failure is not part of the current implementation.
 
-**Key points**
+## 4. Service ports and communication interfaces
 
-- Solid lines are the data path (TCP traffic). Dotted lines are control traffic.
-- The **bottleneck link** is limited on purpose (bandwidth and delay set in `topo.py`), so congestion happens when background traffic runs.
-- The controller talks to the switches over OpenFlow, and receives exam events from the server through the integration module.
+| Port | Protocol | Use |
+|---:|---|---|
+| 6653 | TCP | OpenFlow connection from `s1` to Ryu |
+| 5000 | TCP | Student-to-exam-server connection |
+| 5001 | UDP | iperf background-traffic receiver on `srv` |
+| 8080 | HTTP/TCP | Notifier destination configured in `config.json`; no receiver endpoint is present in `trustme.py` |
+| 8081 | HTTP/TCP | Default local dummy-listener port for notifier testing |
 
-## 4. Communication flow
+### Client to server
 
-A normal exam run, in order:
+The clients and server exchange UTF-8 newline-delimited JSON messages over TCP. Message details belong to Member A's `docs/protocol.md`.
 
-1. The controller starts, and the switches connect to it over OpenFlow.
-2. The exam server starts on `h1` and listens on its TCP port.
-3. A student client connects and sends `LOGIN`.
-4. When the exam begins, the server sends an `exam_start` event to the controller through `integration/notifier.py`.
-5. The controller installs a high-priority flow rule for traffic to the exam server port.
-6. The server sends `QUESTION` messages, and clients send `ANSWER` messages. The server acknowledges each one.
-7. During the exam, the controller polls flow and port statistics periodically and computes link utilization and per-student throughput.
-8. If background traffic congests the bottleneck link, the controller applies its dynamic policy (prioritize exam flows, limit background flows, or reroute).
-9. When the timer expires, the server sends `TIME_UP` to the clients and an `exam_end` event to the controller.
-10. The controller removes or relaxes the exam-specific rules.
-11. The server calculates scores and sends `RESULT` to each student.
+### Controller to switch
 
-## 5. Baseline mode vs SDN mode
+The Ryu controller and Open vSwitch use OpenFlow 1.3. The controller installs flow entries and a meter and requests port statistics.
 
-| | Baseline mode | SDN mode |
+### Server to controller event notification
+
+`integration/notifier.py` constructs a JSON event with a timestamp and sends it by HTTP POST to:
+
+```text
+http://<controller_ip>:<controller_rest_port>/exam/event
+```
+
+The current `controller/trustme.py` does not implement an HTTP `/exam/event` endpoint. The default `controller_ip` in `config.json` is a placeholder (`10.0.0.254`). Therefore the notifier's HTTP transport can be tested with the dummy listener, but end-to-end server-to-controller event delivery is not complete in this source snapshot. The notifier catches failures so the exam server is not supposed to fail solely because notification is unavailable.
+
+## 5. Startup and runtime sequence
+
+1. Start Ryu using `controller/trustme.py`, listening for OpenFlow on TCP port 6653. Set `EXAM_MODE=sdn` or `EXAM_MODE=baseline` before starting the process.
+2. Start `topology/topology.py`. The switch `s1` connects to the controller.
+3. The topology creates `srv`, `bg`, and `h1` through `hN` and starts the network.
+4. The topology automatically starts `server/server.py` on `srv` at TCP port 5000.
+5. The topology automatically starts an iperf UDP receiver on `srv` at port 5001.
+6. Student clients connect to `10.0.0.100:5000`, send `LOGIN`, receive `START` and `QUESTION`, submit `ANSWER`, receive `ACK`, and eventually receive `RESULT` or `TIME_UP`.
+7. The background host runs `experiments/traffic_gen.sh` to offer none, medium or heavy UDP load to `10.0.0.100:5001`.
+8. The controller requests port statistics at its two-second polling interval. It derives the server-link rate from the delta of transmitted byte counters.
+9. At or above 80% utilization of the 10 Mbps server link, SDN mode selects the heaviest eligible sender and installs a meter-controlled flow for its IPv4 traffic to the server.
+10. Experiment outputs are saved per run and processed by `experiments/analyze.py`.
+
+## 6. Baseline mode versus SDN mode
+
+Both modes use the same controller source, `controller/trustme.py`. The mode is selected by the `EXAM_MODE` environment variable, not by the topology's `--mode` argument (which the current topology accepts but ignores).
+
+| Behavior | Baseline (`EXAM_MODE=baseline`) | SDN (`EXAM_MODE=sdn`) |
 |---|---|---|
-| Controller | `baseline_controller.py` (plain learning switch) | `exam_controller.py` |
-| Knows about exam events | No | Yes (receives events from the server) |
-| Traffic classification | None, all traffic treated equally | Exam traffic identified by port and prioritized |
-| Monitoring | None | Periodic flow and port statistics |
-| Reacts to congestion | No | Yes (dynamic policies) |
+| Table-miss rule | Yes | Yes |
+| MAC learning and learned flows | Yes | Yes |
+| Port-statistics polling | Yes | Yes |
+| Controller statistics CSV | Yes | Yes |
+| Exam-specific TCP priority-20 flow | No | Yes |
+| Congestion-triggered sender meter flow | No | Yes |
 
-Both modes are started with the same topology script (`--mode baseline` or `--mode sdn`) and are run with identical experiment settings, so the results are directly comparable.
+In both modes the controller can log congestion statistics. Only SDN mode calls the rate-limit reaction when the threshold is reached.
 
-## 6. Agreed formats
+## 7. Current controller parameters visible in source
 
-These formats were agreed by Members A, B and C. **Do not change them without telling the whole team**, because `notifier.py`, the controller and `analyze.py` all depend on them.
+| Parameter | Current value | Meaning |
+|---|---:|---|
+| `LINK_MBPS` | `config.json` value, currently 10 | Capacity of server-facing link |
+| `SERVER_PORT` | 1 | Switch port connected to `srv` |
+| `EXAM_PORT` | 5000 | TCP examination port |
+| `POLL_INTERVAL` | 2 seconds | Port-statistics poll interval |
+| `THRESHOLD_PCT` | 80 | Congestion threshold |
+| `EXAM_PRIORITY` | 20 | Exam-specific TCP flow priority in SDN mode |
+| `LIMIT_PRIORITY` | 10 | Rate-limit flow priority |
+| Learned flow priority | 1 | MAC-learning forwarding flow |
+| Table-miss priority | 0 | Sends unmatched packets to controller |
+| `LIMIT_KBPS` | 2000 | Meter rate, 2 Mbps |
+| `LIMIT_SECONDS` | 30 | Hard timeout of the rate-limit flow |
+| `MIN_SENDER_MBPS` | 1.0 | Minimum sender input rate considered |
 
-### 6.1 Exam event message (server to controller)
+The exam-specific match is IPv4 TCP traffic whose destination is `SERVER_IP` and TCP destination port is `EXAM_PORT`. The rate-limit flow matches IPv4 packets entering from the selected switch port and destined for `SERVER_IP`; it attaches meter ID 1 and outputs to server port 1. The exam flow's priority 20 is higher than the limit flow's priority 10.
 
-Sent by `integration/notifier.py`, received by `controller/rest_api.py`.
+## 8. Log formats and experiment outputs
 
-```json
-{
-  "event": "exam_start",
-  "timestamp": "2026-11-05T10:30:00.123",
-  "student_count": 10,
-  "server_port": 5000
-}
+### Client events
+
+The current `client/client.py` writes one combined file named `client_events.csv` in the supplied results directory. Its header is:
+
+```csv
+timestamp,student_id,event,question_id,details
 ```
 
-| Event name | Sent when |
-|---|---|
-| `exam_start` | The exam begins |
-| `exam_end` | The timer expires or all students have submitted |
-| `student_joined` | A student logs in |
-| `student_left` | A student disconnects or finishes |
+The client currently records `ANSWER_SENT` and `ACK_RECEIVED` events. Timestamps are UTC strings with fractional seconds and a trailing `Z`. Answer latency is paired by `student_id` and `question_id`.
 
-_Final event names are defined in `docs/protocol.md` (Member A). Update this table if they change._
+### Server log
 
-### 6.2 Application log format (server and clients)
+The current `server/server.py` writes plain-text `server.log` in its process working directory. It is not a CSV file. It records system and student events such as exam start/end, connection establishment, student join/leave, answer submission and time-up.
 
-CSV, one line per event, written to `logs/`.
+### Controller statistics
 
-```
-timestamp,student_id,event,detail
-2026-11-05T10:30:01.250,s03,QUESTION_SENT,q1
-2026-11-05T10:30:01.310,s03,ANSWER_RECEIVED,q1
+The current controller writes the following CSV header to the path in `STATS_CSV` (or `controller_stats.csv` in its current working directory if the environment variable is not set):
+
+```csv
+timestamp,srv_link_mbps,utilization_pct,congested,limited_ports
 ```
 
-- `timestamp`: ISO 8601 with milliseconds, same style everywhere.
-- `student_id`: the student ID, or `server` for server-wide events.
-- `event`: one of `LOGIN`, `QUESTION_SENT`, `ANSWER_RECEIVED`, `TIME_UP`, `RESULT_SENT`, `DISCONNECT`, ...
-- `detail`: question ID or other extra information.
+The timestamp currently has second precision. `limited_ports` is written as a semicolon-separated list, or an empty string when no ports are limited.
 
-### 6.3 Controller statistics format
+### Run folder naming
 
-CSV, one line per polling interval, written by `controller/stats_monitor.py`.
+The experiment runner creates one folder per run:
 
-```
-timestamp,link,utilization_pct,exam_bytes,background_bytes
-2026-11-05T10:30:02.000,s1-s2,64.2,182340,905120
+```text
+results/raw/<mode>_<N>students_<load>load_<run-number>/
 ```
 
-### 6.4 Experiment output
+For example:
 
-Each run of `experiments/run_experiment.sh` saves its logs in `results/raw/` under a folder named after the run:
-
-```
-results/raw/<mode>_<students>students_<load>load_<run-number>/
+```text
+results/raw/sdn_5students_heavyload_1/
 ```
 
-for example `sdn_10students_heavyload_1/`. `analyze.py` reads these folders and writes graphs to `results/graphs/`.
+Expected files include `client_events.csv`, `controller_stats.csv`, `controller.log`, `topology.log`, `auto_client.log`, `traffic_sender.log`, `iperf_receiver.log`, `run_info.txt`, and the server log when available.
 
-## 7. Interfaces between the components
+## 9. Experiment design
 
-| From | To | Mechanism | Defined in |
-|---|---|---|---|
-| Client | Server | TCP sockets, application protocol messages | `docs/protocol.md` |
-| Server | Controller | Exam event message (6.1), sent by `notifier.py` | this document |
-| Controller | Switches | OpenFlow 1.3 | `docs/sdn_design.md` |
-| Experiment scripts | All components | Start and stop commands, log collection | `README.md` section 6 |
-
-### Open decision: how the server reaches the controller
-
-Each Mininet host has its own network namespace, so `127.0.0.1` inside the server host does **not** point to the controller. Member B and Member C choose one approach:
-
-1. A NAT or root-namespace interface added in `topology/topo.py`, so hosts can reach the controller at a known address.
-2. The controller infers exam start and end from the TCP traffic itself, without explicit events.
-
-**Decision:** _to be filled in once agreed (date, chosen option, address)._
-
-## 8. Experiment design
+The core comparison holds student count, load level, duration and topology constant while changing only `EXAM_MODE`.
 
 | Variable | Values |
 |---|---|
-| Network mode | baseline, SDN |
-| Number of students | 3, 6, 10 |
-| Background load | none, medium, heavy |
-| Repetitions | 3 per combination |
+| Mode | `baseline`, `sdn` |
+| Students | 3, 6, 10 are useful comparison points; topology supports 1–99 |
+| Background load | `none`, `medium`, `heavy` |
+| Medium offered load | Approximately 5 Mbps (half of the 10 Mbps bottleneck) |
+| Heavy offered load | Approximately 20 Mbps (twice the bottleneck capacity) |
+| Repetitions | At least 3 per condition for a more reliable comparison |
 
-**Metrics:** response time per question, answer-submission latency, throughput, packet loss, link utilization, fairness across students (Jain's index).
+Metrics produced by the analyzer include mean answer latency, P95 answer latency, Jain's fairness index based on reciprocal per-student mean latency, mean server-link utilization and percentage of controller samples marked congested. iperf logs provide supporting background-traffic sender/receiver measurements; the current analyzer does not convert iperf output into a packet-loss metric.
 
-**Challenging scenarios (at least one):** heavy congestion during the exam, link failure with rerouting, many concurrent students.
+## 10. Decisions and limitations
 
-## 9. Limitations
+| Item | Current state |
+|---|---|
+| Server host and address | Confirmed by topology: `srv`, `10.0.0.100`, switch port 1 |
+| Background host | Confirmed by topology: `bg`, `10.0.0.200`, switch port 2 |
+| Topology script | `topology/topology.py` |
+| Controller script | `controller/trustme.py` |
+| Baseline selection | `EXAM_MODE=baseline` using the same controller file |
+| SDN selection | `EXAM_MODE=sdn` using the same controller file |
+| Notifier endpoint | Not implemented by current controller source; `/exam/event` is only the notifier's target path |
+| Controller address reachable from `srv` | Not finalized; `10.0.0.254` in config is a placeholder |
+| Alternate path/rerouting | Not implemented; topology has one switch and one route to the server |
+| Question-bank file | `server/questions.json` is empty in the supplied snapshot; check with Member A |
 
-_Fill in at the end, for example:_
-- The network is emulated in Mininet, not a physical network.
-- Traffic is not encrypted.
-- The question bank is small.
+## 11. Ownership boundary
+
+Member C owns this architecture document. `docs/protocol.md` is maintained by Member A and `docs/sdn_design.md` by Member B. If an interface or controller behavior changes, agree with the relevant owner and update the corresponding owned document rather than silently editing another member's file.
