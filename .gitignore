@@ -1,6 +1,13 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
 logs/
+server.log
+server_events.log
+controller_stats.csv
+client_events.csv
 results/raw/*.pcap
+results/raw/*/.start
 .DS_Store
+clientt./
