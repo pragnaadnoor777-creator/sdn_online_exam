@@ -1,16 +1,17 @@
 """Computes metrics from experiment runs and plots baseline vs SDN. Owner: Member C.
 
-Usage (from the repo root):  python3 experiments/analyze.py [results/raw]
+Usage (from the repo root): python3 experiments/analyze.py [results/raw] [results/graphs]
 
-Each run folder is named  <mode>_<N>students_<load>load_<run>  and holds:
-  client_events.csv     timestamp,student_id,event,question_id,details       (written by client/auto_client.py)
-  controller_stats.csv  timestamp,srv_link_mbps,utilization_pct,congested,limited_ports   (written by the controller)
+Each run folder is named <mode>_<N>students_<load>load_<run> and holds:
+  client_events.csv     timestamp,student_id,event,question_id,details   (written by client/auto_client.py)
+  controller_stats.csv  timestamp,srv_link_mbps,utilization_pct,congested,limited_ports (written by the controller)
   iperf_receiver.log    UDP report of the background traffic (optional)
+  auto_client.log       console output of the simulated students (optional, used to count failed students)
 
 Latency of one answer = time between ANSWER_SENT and ACK_RECEIVED of the same student and question.
 Records are paired by student_id + question_id; if the same student answers the same question several times,
 the 1st ANSWER_SENT is paired with the 1st ACK_RECEIVED, the 2nd with the 2nd, and so on.
-Outputs: results/graphs/summary.csv, results/graphs/latency_<load>.png, results/graphs/utilization.png
+Outputs: <out>/summary.csv, <out>/latency_<load>.png, <out>/utilization.png   (<out> defaults to results/graphs)
 """
 import glob
 import os
@@ -24,6 +25,8 @@ import pandas as pd
 
 RUN_RE = re.compile(r"(?P<mode>baseline|sdn)_(?P<n>\d+)students_(?P<load>[a-z]+?)load_(?P<run>\d+)")
 UDP_RE = re.compile(r"([\d.]+)\s+([KMG])bits/sec.*?(\d+)\s*/\s*(\d+)\s*\(([\d.]+)%\)")
+FAILED_RE = re.compile(r"(\d+)\s+failed")
+LOAD_ORDER = {"none": 0, "medium": 1, "heavy": 2}
 
 
 def parse_ts(series):
@@ -46,14 +49,15 @@ def client_metrics(folder):
     path = os.path.join(folder, "client_events.csv")
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return None
-    df = pd.read_csv(path)
+    # read ids as text so "1" and "1.0" can never end up as different keys
+    df = pd.read_csv(path, dtype={"student_id": str, "question_id": str})
     needed = {"timestamp", "student_id", "event", "question_id"}
     if not needed.issubset(df.columns):
         print("  skipped {}: client_events.csv has columns {} (expected {})".format(
             os.path.basename(folder), list(df.columns), sorted(needed)))
         return None
     df["timestamp"] = parse_ts(df["timestamp"])
-    df["question_id"] = df["question_id"].astype(str)
+    df["question_id"] = df["question_id"].fillna("").astype(str)
     sent = df[df.event == "ANSWER_SENT"].copy()
     ack = df[df.event == "ACK_RECEIVED"].copy()
     keys = ["student_id", "question_id"]
@@ -73,9 +77,27 @@ def client_metrics(folder):
         "mean_latency_ms": pairs["latency_ms"].mean(),
         "p95_latency_ms": pairs["latency_ms"].quantile(0.95),
         "max_latency_ms": pairs["latency_ms"].max(),
-        "fairness": jain_index(list(1.0 / per_student[per_student > 0])),   # fairness of per-student speed
+        "fairness": jain_index(list(1.0 / per_student[per_student > 0])),  # fairness of per-student speed
         "error_events": int(errors),
     }
+
+
+def client_log_metrics(folder):
+    """Simulated students that failed (login rejected, connection error ...), from auto_client.log.
+    client_events.csv never contains errors, so this is the real failure count."""
+    path = os.path.join(folder, "auto_client.log")
+    out = {"failed_students": float("nan")}
+    if not os.path.exists(path):
+        return out
+    total = 0
+    with open(path, errors="ignore") as f:
+        for line in f:
+            if line.startswith("Simulation complete"):
+                m = FAILED_RE.search(line)
+                if m:
+                    total += int(m.group(1))
+    out["failed_students"] = total
+    return out
 
 
 def controller_metrics(folder):
@@ -85,10 +107,11 @@ def controller_metrics(folder):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return empty
     df = pd.read_csv(path)
-    if "utilization_pct" not in df.columns:
+    if "utilization_pct" not in df.columns or df.empty:
         return empty
-    congested = df["congested"].astype(str).str.strip().str.lower().isin(["1", "true", "yes"])
-    limited = ~df["limited_ports"].astype(str).str.strip().str.lower().isin(["", "[]", "none", "nan", "{}"])
+    # fillna first: an empty limited_ports cell is read as NaN, and newer pandas keeps NaN through astype(str)
+    congested = df["congested"].fillna("").astype(str).str.strip().str.lower().isin(["1", "1.0", "true", "yes"])
+    limited = ~df["limited_ports"].fillna("").astype(str).str.strip().str.lower().isin(["", "[]", "none", "nan", "{}"])
     return {"mean_util_pct": df["utilization_pct"].mean(), "max_util_pct": df["utilization_pct"].max(),
             "congested_pct": congested.mean() * 100, "limit_active_pct": limited.mean() * 100}
 
@@ -100,10 +123,11 @@ def iperf_metrics(folder):
     if not os.path.exists(path):
         return out
     last = None
-    for line in open(path, errors="ignore"):
-        m = UDP_RE.search(line)
-        if m:
-            last = m
+    with open(path, errors="ignore") as f:
+        for line in f:
+            m = UDP_RE.search(line)
+            if m:
+                last = m
     if last:
         rate, unit = float(last.group(1)), last.group(2)
         out["bg_mbps"] = rate * {"K": 0.001, "M": 1, "G": 1000}[unit]
@@ -111,7 +135,7 @@ def iperf_metrics(folder):
     return out
 
 
-def main(results_dir):
+def main(results_dir, out_dir="results/graphs"):
     rows = []
     for folder in sorted(glob.glob(os.path.join(results_dir, "*"))):
         m = RUN_RE.fullmatch(os.path.basename(folder))
@@ -119,21 +143,21 @@ def main(results_dir):
             continue
         cm = client_metrics(folder)
         if cm:
-            rows.append({**m.groupdict(), **cm, **controller_metrics(folder), **iperf_metrics(folder)})
+            rows.append({**m.groupdict(), **cm, **client_log_metrics(folder),
+                         **controller_metrics(folder), **iperf_metrics(folder)})
     if not rows:
         print("No usable run folders in", results_dir)
         return
     df = pd.DataFrame(rows)
     df["n"] = df["n"].astype(int)
-    order = {"none": 0, "medium": 1, "heavy": 2}
     cols = ["answers", "mean_latency_ms", "p95_latency_ms", "max_latency_ms", "fairness", "error_events",
-            "mean_util_pct", "congested_pct", "limit_active_pct", "bg_mbps", "bg_loss_pct"]
+            "failed_students", "mean_util_pct", "congested_pct", "limit_active_pct", "bg_mbps", "bg_loss_pct"]
     summary = df.groupby(["load", "n", "mode"])[cols].mean().round(2)
-    summary = summary.sort_index(key=lambda idx: idx.map(order) if idx.name == "load" else idx)
-    pd.set_option("display.width", 200, "display.max_columns", 20)
+    summary = summary.sort_index(key=lambda idx: idx.map(LOAD_ORDER) if idx.name == "load" else idx)
+    pd.set_option("display.width", 220, "display.max_columns", 20)
     print(summary)
-    os.makedirs("results/graphs", exist_ok=True)
-    summary.to_csv("results/graphs/summary.csv")
+    os.makedirs(out_dir, exist_ok=True)
+    summary.to_csv(os.path.join(out_dir, "summary.csv"))
 
     for load, sub in df.groupby("load"):
         pivot = sub.groupby(["n", "mode"])["mean_latency_ms"].mean().unstack()
@@ -141,17 +165,19 @@ def main(results_dir):
         plt.xlabel("Number of students")
         plt.ylabel("Latency (ms)")
         plt.tight_layout()
-        plt.savefig("results/graphs/latency_{}.png".format(load))
+        plt.savefig(os.path.join(out_dir, "latency_{}.png".format(load)))
         plt.close()
     if df["mean_util_pct"].notna().any():
         pivot = df.groupby(["load", "mode"])["mean_util_pct"].mean().unstack()
+        pivot = pivot.reindex([l for l in LOAD_ORDER if l in pivot.index])   # none, medium, heavy
         pivot.plot(kind="bar", title="Mean utilization of the srv link")
         plt.ylabel("Utilization (%)")
         plt.tight_layout()
-        plt.savefig("results/graphs/utilization.png")
+        plt.savefig(os.path.join(out_dir, "utilization.png"))
         plt.close()
-    print("Saved results/graphs/summary.csv and the graphs")
+    print("Saved {}/summary.csv and the graphs".format(out_dir))
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "results/raw")
+    main(sys.argv[1] if len(sys.argv) > 1 else "results/raw",
+         sys.argv[2] if len(sys.argv) > 2 else "results/graphs")
